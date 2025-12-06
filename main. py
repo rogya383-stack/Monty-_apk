@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+قارئ PDF احترافي - الإصدار 1.0
+Professional PDF Reader
+"""
+
+import sys
+import os
+from PyQt5.QtWidgets import QApplication, QSplashScreen
+from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtCore import Qt, QTimer
+
+# استيراد النافذة الرئيسية
+try:
+    from gui.main_window import MainWindow
+except ImportError as e:
+    print(f"خطأ في استيراد الوحدات: {e}")
+    print("تأكد من وجود الملفات التالية:")
+    print("- core/pdf_handler.py")
+    print("- gui/main_window.py")
+    print("- gui/toolbar.py")
+    print("- gui/sidebar.py")
+    print("- gui/thumbnails.py")
+    print("- gui/dialogs.py")
+    print("- utils/themes.py")
+    sys.exit(1)
+
+def check_dependencies():
+    """فحص المكتبات المطلوبة"""
+    required_libraries = [
+        'PyQt5',
+        'fitz',  # PyMuPDF
+        'pdfplumber',
+        'PIL',   # Pillow
+        'numpy'
+    ]
+    
+    missing_libs = []
+    for lib in required_libraries:
+        try:
+            if lib == 'fitz':
+                import fitz
+            elif lib == 'PIL':
+                from PIL import Image
+            else:
+                __import__(lib)
+        except ImportError:
+            missing_libs.append(lib)
+    
+    if missing_libs:
+        print("⚠️  المكتبات التالية غير مثبتة:")
+        for lib in missing_libs:
+            print(f"   - {lib}")
+        print("\n📦 قم بتثبيتها باستخدام:")
+        print("   pip install PyMuPDF PyQt5 pdfplumber Pillow numpy opencv-python")
+        return False
+    return True
+
+def create_project_structure():
+    """إنشاء هيكل المجلدات إذا لم يكن موجوداً"""
+    folders = ['core', 'gui', 'utils']
+    
+    for folder in folders:
+        if not os.path.exists(folder):
+            try:
+                os.makedirs(folder)
+                # إنشاء ملف __init__.py فارغ في كل مجلد
+                init_file = os.path.join(folder, '__init__.py')
+                with open(init_file, 'w', encoding='utf-8') as f:
+                    f.write('')
+                print(f"✓ تم إنشاء مجلد: {folder}")
+            except Exception as e:
+                print(f"✗ خطأ في إنشاء مجلد {folder}: {e}")
+
+def main():
+    """الدالة الرئيسية لتشغيل التطبيق"""
+    
+    # إنشاء هيكل المجلدات
+    create_project_structure()
+    
+    # فحص المكتبات
+    if not check_dependencies():
+        response = input("\nهل تريد المتابعة على أي حال؟ (نعم/لا): ")
+        if response.lower() not in ['نعم', 'yes', 'y', '']:
+            print("إغلاق التطبيق...")
+            sys.exit(1)
+    
+    # إنشاء التطبيق
+    app = QApplication(sys.argv)
+    
+    # إعداد الخط الافتراضي لدعم العربية
+    font = QFont("Arial", 10)
+    # محاولة استخدام خطوط أخرى إذا كان Arial غير موجود
+    font_families = ["Arial", "DejaVu Sans", "Noto Sans Arabic", "Segoe UI", "Times New Roman"]
+    available_fonts = QFont().families()
+    
+    for font_name in font_families:
+        if font_name in available_fonts:
+            font = QFont(font_name, 10)
+            break
+    
+    app.setFont(font)
+    
+    # شاشة الترحيب
+    try:
+        splash_pix = QPixmap(400, 300)
+        splash_pix.fill(Qt.white)
+        splash = QSplashScreen(splash_pix)
+        
+        # نص الترحيب
+        welcome_text = """
+        <div style='text-align: center; padding: 20px;'>
+            <h2>قارئ PDF احترافي</h2>
+            <p>Professional PDF Reader</p>
+            <p>الإصدار 1.0</p>
+            <p style='margin-top: 30px;'>جاري التحميل...</p>
+        </div>
+        """
+        
+        splash.showMessage(welcome_text, 
+                          Qt.AlignCenter | Qt.AlignCenter, 
+                          Qt.black)
+        splash.show()
+        
+        # تحديث الواجهة
+        app.processEvents()
+    except Exception as e:
+        print(f"ملاحظة: لم يتم عرض شاشة الترحيب: {e}")
+        splash = None
+    
+    try:
+        # إنشاء النافذة الرئيسية
+        window = MainWindow()
+        
+        # إغلاق شاشة الترحيب بعد ثانيتين
+        if splash:
+            QTimer.singleShot(2000, splash.close)
+            QTimer.singleShot(2000, window.show)
+        else:
+            window.show()
+        
+        # عرض رسالة ترحيب في وحدة التحكم
+        print("\n" + "="*50)
+        print("قارئ PDF احترافي - بدء التشغيل")
+        print("="*50)
+        print("الإجراءات المتاحة:")
+        print("1. فتح ملف PDF: Ctrl+O أو من قائمة ملف")
+        print("2. البحث في الملف: Ctrl+F")
+        print("3. التنقل بين الصفحات: PgUp/PgDown")
+        print("4. التكبير/التصغير: Ctrl++ / Ctrl+-")
+        print("5. إضافة تعليقات: من شريط الأدوات")
+        print("="*50)
+        
+        # تشغيل التطبيق
+        exit_code = app.exec_()
+        
+        # رسالة الخروج
+        print("\nشكراً لاستخدامك قارئ PDF احترافي!")
+        sys.exit(exit_code)
+        
+    except Exception as e:
+        print(f"\n❌ حدث خطأ غير متوقع: {e}")
+        print("\nتفاصيل الخطأ:")
+        import traceback
+        traceback.print_exc()
+        
+        input("\nاضغط Enter لإغلاق...")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
