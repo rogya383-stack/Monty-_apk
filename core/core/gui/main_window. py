@@ -1,0 +1,1692 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Main Window Module - النافذة الرئيسية
+الوحدة الرئيسية لواجهة المستخدم لقارئ PDF
+"""
+
+import sys
+import os
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QStatusBar, QFileDialog, QMessageBox, QLabel, QProgressBar,
+    QToolBar, QAction, QDockWidget, QMenuBar, QMenu, QApplication,
+    QScrollArea, QShortcut
+)
+from PyQt5.QtGui import (
+    QIcon, QPixmap, QImage, QPainter, QPen, QColor, QFont,
+    QKeySequence, QCursor, QMouseEvent, QWheelEvent
+)
+from PyQt5.QtCore import (
+    Qt, QSize, QTimer, pyqtSignal, QPoint, QRect, QEvent,
+    QSettings, QDir, QFileInfo
+)
+
+from core.pdf_handler import PDFHandler
+from .toolbar import MainToolBar
+from .sidebar import SideBar
+from .thumbnails import ThumbnailPanel
+from .dialogs import (
+    SearchDialog, GotoPageDialog, SettingsDialog,
+    ExportDialog, PropertiesDialog, AboutDialog
+)
+from utils.themes import ThemeManager
+
+class PDFCanvas(QWidget):
+    """لوحة رسم PDF مع دعم التفاعل"""
+    
+    # إشارات
+    pageClicked = pyqtSignal(int, QPoint)  # (page_num, position)
+    zoomChanged = pyqtSignal(float)
+    viewportChanged = pyqtSignal(QRect)
+    annotationAdded = pyqtSignal(dict)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.pdf_handler = None
+        
+        # حالة العرض
+        self.current_page = 0
+        self.zoom_level = 1.5
+        self.rotation = 0
+        self.page_image = None
+        self.image_offset = QPoint(0, 0)
+        
+        # وضع التفاعل
+        self.interaction_mode = "hand"  # hand, select, highlight, note
+        self.is_panning = False
+        self.pan_start_pos = QPoint()
+        self.viewport_offset = QPoint(0, 0)
+        
+        # التعليقات التوضيحية
+        self.current_annotation = None
+        self.annotation_start = QPoint()
+        
+        # التحديد
+        self.selection_rect = QRect()
+        self.has_selection = False
+        
+        # التخصيص
+        self.show_annotations = True
+        self.show_grid = False
+        self.grid_size = 20
+        self.backgroundColor = QColor(240, 240, 240)
+        self.pageShadowColor = QColor(100, 100, 100, 100)
+        
+        # تحسينات الأداء
+        self.cache_enabled = True
+        self.image_cache = {}
+        self.max_cache_size = 10
+        
+        self.setMouseTracking(True)
+        self.setMinimumSize(400, 400)
+        self.setFocusPolicy(Qt.StrongFocus)
+        
+        # إعداد السياق
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+        
+    def set_pdf_handler(self, handler):
+        """تعيين معالج PDF"""
+        self.pdf_handler = handler
+        if handler and handler.total_pages > 0:
+            self.current_page = 0
+            self.load_page_image()
+    
+    def load_page_image(self):
+        """تحميل صورة الصفحة الحالية"""
+        if not self.pdf_handler:
+            return
+        
+        # التحقق من وجود الصفحة في الذاكرة المؤقتة
+        cache_key = f"{self.current_page}_{self.zoom_level}_{self.rotation}"
+        
+        if self.cache_enabled and cache_key in self.image_cache:
+            self.page_image = self.image_cache[cache_key]
+        else:
+            # تحميل الصورة الجديدة
+            self.page_image = self.pdf_handler.get_page_image(
+                self.current_page, 
+                self.zoom_level,
+                self.rotation
+            )
+            
+            # تخزين في الذاكرة المؤقتة
+            if self.cache_enabled and self.page_image:
+                self.image_cache[cache_key] = self.page_image
+                
+                # التحكم في حجم الذاكرة المؤقتة
+                if len(self.image_cache) > self.max_cache_size:
+                    oldest_key = next(iter(self.image_cache))
+                    del self.image_cache[oldest_key]
+        
+        self.update()
+        self.zoomChanged.emit(self.zoom_level)
+    
+    def paintEvent(self, event):
+        """رسم اللوحة"""
+        painter = QPainter(self)
+        
+        # خلفية
+        painter.fillRect(self.rect(), self.backgroundColor)
+        
+        if self.page_image:
+            # حساب إزاحة الصورة للتمركز
+            img_width = self.page_image.width
+            img_height = self.page_image.height
+            
+            available_width = self.width() - 40  # هوامش
+            available_height = self.height() - 40
+            
+            # حساب نسبة التكبير التلقائي إذا لزم
+            if self.zoom_level <= 0:
+                width_ratio = available_width / img_width
+                height_ratio = available_height / img_height
+                auto_zoom = min(width_ratio, height_ratio) * 0.95
+                self.zoom_level = auto_zoom
+                self.load_page_image()
+                return
+            
+            # تطبيق إزاحة العرض
+            offset_x = (self.width() - img_width) // 2 + self.viewport_offset.x()
+            offset_y = (self.height() - img_height) // 2 + self.viewport_offset.y()
+            
+            # حفظ الإزاحة
+            self.image_offset = QPoint(offset_x, offset_y)
+            
+            # رسم ظل الصفحة
+            if self.pageShadowColor:
+                shadow_rect = QRect(
+                    offset_x + 5,
+                    offset_y + 5,
+                    img_width,
+                    img_height
+                )
+                painter.fillRect(shadow_rect, self.pageShadowColor)
+            
+            # رسم الصورة
+            qimage = QImage(
+                self.page_image.tobytes(),
+                img_width,
+                img_height,
+                QImage.Format_RGB888
+            )
+            
+            painter.drawImage(offset_x, offset_y, qimage)
+            
+            # رسم الشبكة إذا مفعلة
+            if self.show_grid:
+                self.draw_grid(painter, offset_x, offset_y, img_width, img_height)
+            
+            # رسم التعليقات التوضيحية
+            if self.show_annotations and self.pdf_handler:
+                self.draw_annotations(painter, offset_x, offset_y)
+            
+            # رسم التحديد الحالي
+            if self.has_selection and not self.selection_rect.isEmpty():
+                self.draw_selection(painter, offset_x, offset_y)
+            
+            # رسم التعليق قيد الإنشاء
+            if self.current_annotation:
+                self.draw_current_annotation(painter, offset_x, offset_y)
+            
+            # رسم حدود الصفحة
+            painter.setPen(QPen(QColor(100, 100, 100), 1))
+            painter.drawRect(offset_x, offset_y, img_width, img_height)
+            
+            # معلومات الصفحة في الزاوية
+            if self.pdf_handler:
+                page_info = f"الصفحة {self.current_page + 1}/{self.pdf_handler.total_pages}"
+                painter.setPen(QColor(0, 0, 0))
+                painter.drawText(offset_x + 10, offset_y + 20, page_info)
+    
+    def draw_grid(self, painter, offset_x, offset_y, width, height):
+        """رسم الشبكة"""
+        grid_color = QColor(200, 200, 200, 100)
+        painter.setPen(QPen(grid_color, 1, Qt.DotLine))
+        
+        # خطوط عمودية
+        for x in range(offset_x, offset_x + width, self.grid_size):
+            painter.drawLine(x, offset_y, x, offset_y + height)
+        
+        # خطوط أفقية
+        for y in range(offset_y, offset_y + height, self.grid_size):
+            painter.drawLine(offset_x, y, offset_x + width, y)
+    
+    def draw_annotations(self, painter, offset_x, offset_y):
+        """رسم التعليقات التوضيحية"""
+        if not self.pdf_handler:
+            return
+        
+        annotations = self.pdf_handler.get_page_annotations(self.current_page)
+        
+        for annotation in annotations:
+            ann_type = annotation['type']
+            points = annotation['points']
+            color = annotation['color']
+            
+            qcolor = QColor(
+                int(color[0] * 255),
+                int(color[1] * 255),
+                int(color[2] * 255),
+                150  # شفافية
+            )
+            
+            painter.setPen(QPen(qcolor, 2))
+            
+            if ann_type == "highlight":
+                painter.setBrush(QColor(255, 255, 0, 100))
+                if len(points) == 4:  # [x, y, width, height]
+                    rect = QRect(
+                        offset_x + points[0],
+                        offset_y + points[1],
+                        points[2],
+                        points[3]
+                    )
+                    painter.drawRect(rect)
+            
+            elif ann_type == "underline":
+                painter.setBrush(Qt.NoBrush)
+                if len(points) >= 2:
+                    painter.drawLine(
+                        offset_x + points[0],
+                        offset_y + points[1],
+                        offset_x + points[2],
+                        offset_y + points[3]
+                    )
+            
+            elif ann_type == "rectangle":
+                painter.setBrush(Qt.NoBrush)
+                if len(points) == 4:
+                    rect = QRect(
+                        offset_x + points[0],
+                        offset_y + points[1],
+                        points[2],
+                        points[3]
+                    )
+                    painter.drawRect(rect)
+            
+            elif ann_type == "circle":
+                painter.setBrush(Qt.NoBrush)
+                if len(points) == 4:
+                    rect = QRect(
+                        offset_x + points[0],
+                        offset_y + points[1],
+                        points[2],
+                        points[3]
+                    )
+                    painter.drawEllipse(rect)
+            
+            elif ann_type == "text" and annotation.get('text'):
+                # رسم نص التعليق
+                painter.setPen(QColor(0, 0, 0))
+                if len(points) >= 2:
+                    painter.drawText(
+                        offset_x + points[0],
+                        offset_y + points[1] + 15,  # إزاحة للنص
+                        annotation['text']
+                    )
+    
+    def draw_selection(self, painter, offset_x, offset_y):
+        """رسم منطقة التحديد"""
+        selection_color = QColor(0, 120, 215, 50)
+        border_color = QColor(0, 120, 215)
+        
+        # تعبئة المنطقة
+        painter.setBrush(selection_color)
+        painter.setPen(QPen(border_color, 1, Qt.DashLine))
+        
+        selection_rect = self.selection_rect.translated(offset_x, offset_y)
+        painter.drawRect(selection_rect)
+    
+    def draw_current_annotation(self, painter, offset_x, offset_y):
+        """رسم التعليق الحالي قيد الإنشاء"""
+        if not self.current_annotation:
+            return
+        
+        ann_type = self.current_annotation['type']
+        start = self.current_annotation['start']
+        end = self.current_annotation['end']
+        
+        if start is None or end is None:
+            return
+        
+        # حساب المستطيل
+        rect = QRect(start, end).normalized()
+        
+        # اختيار اللون حسب النوع
+        if ann_type == "highlight":
+            color = QColor(255, 255, 0, 100)
+            painter.setBrush(color)
+            painter.setPen(QPen(QColor(200, 200, 0), 1))
+        elif ann_type == "rectangle":
+            color = QColor(255, 0, 0, 50)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(255, 0, 0), 2))
+        elif ann_type == "circle":
+            color = QColor(0, 255, 0, 50)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(0, 255, 0), 2))
+        else:  # خط أو نص
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 255), 2))
+        
+        # الرسم
+        if ann_type in ["rectangle", "highlight"]:
+            painter.drawRect(rect.translated(offset_x, offset_y))
+        elif ann_type == "circle":
+            painter.drawEllipse(rect.translated(offset_x, offset_y))
+        elif ann_type in ["underline", "strikeout"]:
+            y_pos = start.y() if ann_type == "underline" else start.y() + rect.height() / 2
+            painter.drawLine(
+                offset_x + start.x(),
+                offset_y + y_pos,
+                offset_x + end.x(),
+                offset_y + y_pos
+            )
+    
+    def mousePressEvent(self, event):
+        """معالجة ضغط الماوس"""
+        pos = event.pos()
+        
+        if event.button() == Qt.LeftButton:
+            if self.interaction_mode == "hand":
+                # بدء التمرير
+                self.is_panning = True
+                self.pan_start_pos = pos
+                self.setCursor(Qt.ClosedHandCursor)
+                
+            elif self.interaction_mode in ["highlight", "rectangle", "circle", "underline", "strikeout"]:
+                # بدء رسم تعليق
+                self.start_annotation(pos)
+                
+            elif self.interaction_mode == "select":
+                # بدء التحديد
+                self.start_selection(pos)
+        
+        elif event.button() == Qt.RightButton:
+            # يمكن معالجة قائمة السياق هنا
+            pass
+        
+        self.update()
+    
+    def mouseMoveEvent(self, event):
+        """معالجة حركة الماوس"""
+        pos = event.pos()
+        
+        if self.is_panning:
+            # التمرير
+            delta = pos - self.pan_start_pos
+            self.viewport_offset += delta
+            self.pan_start_pos = pos
+            self.update()
+            self.viewportChanged.emit(self.get_viewport_rect())
+            
+        elif self.current_annotation and self.current_annotation['start']:
+            # تحديث التعليق قيد الرسم
+            self.update_annotation(pos)
+            
+        elif self.has_selection:
+            # تحديث التحديد
+            self.update_selection(pos)
+        
+        # تحديث موضع المؤشر في شريط الحالة
+        if hasattr(self.parent, 'update_cursor_position'):
+            self.parent.update_cursor_position(pos)
+    
+    def mouseReleaseEvent(self, event):
+        """معالجة تحرير الماوس"""
+        if event.button() == Qt.LeftButton:
+            if self.is_panning:
+                # إنهاء التمرير
+                self.is_panning = False
+                self.setCursor(Qt.ArrowCursor)
+                
+            elif self.current_annotation and self.current_annotation['start']:
+                # إنهاء رسم التعليق
+                self.finish_annotation()
+                
+            elif self.has_selection:
+                # إنهاء التحديد
+                self.finish_selection()
+        
+        self.update()
+    
+    def wheelEvent(self, event):
+        """معالجة عجلة الماوس"""
+        modifiers = event.modifiers()
+        delta = event.angleDelta().y()
+        
+        if modifiers & Qt.ControlModifier:
+            # التكبير/التصغير
+            if delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            event.accept()
+            
+        elif modifiers & Qt.ShiftModifier:
+            # التنقل أفقي بين الصفحات
+            if delta > 0:
+                self.previous_page()
+            else:
+                self.next_page()
+            event.accept()
+            
+        else:
+            # تمرير عمودي
+            super().wheelEvent(event)
+    
+    def start_annotation(self, pos):
+        """بدء رسم تعليق توضيحي"""
+        # التحقق من أن النقر داخل حدود الصورة
+        if not self.is_point_inside_image(pos):
+            return
+        
+        # تعديل الإحداثيات بالنسبة لموقع الصورة
+        img_pos = pos - self.image_offset
+        
+        self.current_annotation = {
+            'type': self.interaction_mode,
+            'start': img_pos,
+            'end': img_pos,
+            'color': self.get_annotation_color()
+        }
+    
+    def update_annotation(self, pos):
+        """تحديث التعليق أثناء الرسم"""
+        if not self.current_annotation or not self.is_point_inside_image(pos):
+            return
+        
+        img_pos = pos - self.image_offset
+        self.current_annotation['end'] = img_pos
+        self.update()
+    
+    def finish_annotation(self):
+        """إنهاء رسم التعليق وحفظه"""
+        if not self.current_annotation or not self.pdf_handler:
+            return
+        
+        start = self.current_annotation['start']
+        end = self.current_annotation['end']
+        
+        if start == end:
+            self.current_annotation = None
+            return
+        
+        # حساب نقاط التعليق
+        rect = QRect(start, end).normalized()
+        points = [rect.x(), rect.y(), rect.width(), rect.height()]
+        
+        # إضافة التعليق إلى معالج PDF
+        annotation_id = self.pdf_handler.add_annotation(
+            self.current_page,
+            self.current_annotation['type'],
+            points,
+            self.current_annotation['color']
+        )
+        
+        # إرسال إشارة
+        annotation_data = {
+            'id': annotation_id,
+            'type': self.current_annotation['type'],
+            'page': self.current_page,
+            'rect': rect
+        }
+        self.annotationAdded.emit(annotation_data)
+        
+        self.current_annotation = None
+        self.update()
+    
+    def start_selection(self, pos):
+        """بدء تحديد منطقة"""
+        if not self.is_point_inside_image(pos):
+            return
+        
+        img_pos = pos - self.image_offset
+        self.selection_rect = QRect(img_pos, QSize(0, 0))
+        self.has_selection = True
+    
+    def update_selection(self, pos):
+        """تحديث منطقة التحديد"""
+        if not self.has_selection or not self.is_point_inside_image(pos):
+            return
+        
+        img_pos = pos - self.image_offset
+        self.selection_rect.setBottomRight(img_pos)
+        self.update()
+    
+    def finish_selection(self):
+        """إنهاء التحديد"""
+        if self.has_selection and not self.selection_rect.isEmpty():
+            # هنا يمكن نسخ النص المحدد أو تنفيذ إجراء آخر
+            text = self.get_selected_text()
+            if text:
+                print(f"النص المحدد: {text}")
+        
+        self.has_selection = False
+        self.selection_rect = QRect()
+        self.update()
+    
+    def get_selected_text(self):
+        """الحصول على النص في المنطقة المحددة"""
+        if not self.pdf_handler or not self.has_selection:
+            return ""
+        
+        # هذا تبسيط - في التطبيق الحقيقي تحتاج لتحويل الإحداثيات
+        try:
+            page_text = self.pdf_handler.get_page_text(self.current_page)
+            return page_text  # سيعيد كل نص الصفحة في هذا المثال
+        except:
+            return ""
+    
+    def is_point_inside_image(self, pos):
+        """التحقق إذا كانت النقطة داخل حدود الصورة"""
+        if not self.page_image:
+            return False
+        
+        img_width = self.page_image.width
+        img_height = self.page_image.height
+        
+        return (
+            self.image_offset.x() <= pos.x() <= self.image_offset.x() + img_width and
+            self.image_offset.y() <= pos.y() <= self.image_offset.y() + img_height
+        )
+    
+    def get_viewport_rect(self):
+        """الحصول على منطقة العرض الحالية"""
+        if not self.page_image:
+            return QRect()
+        
+        return QRect(
+            -self.viewport_offset.x(),
+            -self.viewport_offset.y(),
+            self.width(),
+            self.height()
+        )
+    
+    def get_annotation_color(self):
+        """الحصول على لون التعليق حسب النوع"""
+        if self.interaction_mode == "highlight":
+            return (1.0, 1.0, 0.0)  # أصفر
+        elif self.interaction_mode == "underline":
+            return (0.0, 0.0, 1.0)  # أزرق
+        elif self.interaction_mode == "strikeout":
+            return (1.0, 0.0, 0.0)  # أحمر
+        elif self.interaction_mode == "rectangle":
+            return (0.0, 1.0, 0.0)  # أخضر
+        elif self.interaction_mode == "circle":
+            return (1.0, 0.0, 1.0)  # أرجواني
+        else:
+            return (0.5, 0.5, 0.5)  # رمادي
+    
+    # ============================================================================
+    # عمليات التنقل
+    # ============================================================================
+    
+    def next_page(self):
+        """الصفحة التالية"""
+        if self.pdf_handler and self.current_page < self.pdf_handler.total_pages - 1:
+            self.current_page += 1
+            self.load_page_image()
+            self.pageClicked.emit(self.current_page, QPoint())
+    
+    def previous_page(self):
+        """الصفحة السابقة"""
+        if self.pdf_handler and self.current_page > 0:
+            self.current_page -= 1
+            self.load_page_image()
+            self.pageClicked.emit(self.current_page, QPoint())
+    
+    def goto_page(self, page_num):
+        """الانتقال إلى صفحة محددة"""
+        if self.pdf_handler and 0 <= page_num < self.pdf_handler.total_pages:
+            self.current_page = page_num
+            self.load_page_image()
+            self.pageClicked.emit(self.current_page, QPoint())
+    
+    # ============================================================================
+    # عمليات التكبير/التصغير
+    # ============================================================================
+    
+    def zoom_in(self):
+        """تكبير"""
+        self.zoom_level = min(self.zoom_level + 0.2, 5.0)
+        self.load_page_image()
+    
+    def zoom_out(self):
+        """تصغير"""
+        self.zoom_level = max(self.zoom_level - 0.2, 0.2)
+        self.load_page_image()
+    
+    def zoom_to_fit(self):
+        """تكبير لملاءمة العرض"""
+        if self.page_image:
+            width_ratio = self.width() / self.page_image.width
+            height_ratio = self.height() / self.page_image.height
+            self.zoom_level = min(width_ratio, height_ratio) * 0.95
+            self.load_page_image()
+    
+    def zoom_to_actual(self):
+        """تكبير 100%"""
+        self.zoom_level = 1.0
+        self.load_page_image()
+    
+    def rotate_left(self):
+        """تدوير عكس عقارب الساعة"""
+        self.rotation = (self.rotation - 90) % 360
+        self.load_page_image()
+    
+    def rotate_right(self):
+        """تدوير مع عقارب الساعة"""
+        self.rotation = (self.rotation + 90) % 360
+        self.load_page_image()
+    
+    # ============================================================================
+    # إعدادات العرض
+    # ============================================================================
+    
+    def set_interaction_mode(self, mode):
+        """تعيين وضع التفاعل"""
+        valid_modes = ["hand", "select", "highlight", "underline", 
+                      "strikeout", "rectangle", "circle", "note"]
+        
+        if mode in valid_modes:
+            self.interaction_mode = mode
+            
+            # تغيير شكل المؤشر
+            if mode == "hand":
+                self.setCursor(Qt.OpenHandCursor)
+            elif mode in ["select", "highlight"]:
+                self.setCursor(Qt.CrossCursor)
+            elif mode == "note":
+                self.setCursor(Qt.IBeamCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+    
+    def toggle_annotations(self, show):
+        """تفعيل/تعطيل عرض التعليقات"""
+        self.show_annotations = show
+        self.update()
+    
+    def toggle_grid(self, show):
+        """تفعيل/تعطيل الشبكة"""
+        self.show_grid = show
+        self.update()
+    
+    def set_background_color(self, color):
+        """تعيين لون الخلفية"""
+        self.backgroundColor = color
+        self.update()
+    
+    def clear_cache(self):
+        """مسح الذاكرة المؤقتة"""
+        self.image_cache.clear()
+    
+    def show_context_menu(self, pos):
+        """عرض قائمة السياق"""
+        # يمكن إضافة قائمة السياق هنا
+        pass
+
+
+class MainWindow(QMainWindow):
+    """النافذة الرئيسية للتطبيق"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # تهيئة المتغيرات
+        self.pdf_handler = PDFHandler()
+        self.theme_manager = ThemeManager()
+        self.settings = QSettings("PDFReader", "ProfessionalPDFReader")
+        
+        # حالة التطبيق
+        self.current_file = None
+        self.recent_files = []
+        self.is_fullscreen = False
+        self.window_state_before_fullscreen = None
+        
+        # تهيئة واجهة المستخدم
+        self.init_ui()
+        self.setup_shortcuts()
+        self.load_settings()
+        
+        # تطبيق السمة
+        self.apply_theme("light")
+        
+        # إظهار النافذة
+        self.show()
+        
+        # تحميل الملف الأخير إذا كان موجوداً
+        self.load_last_file()
+    
+    def init_ui(self):
+        """تهيئة واجهة المستخدم"""
+        # إعداد النافذة
+        self.setWindowTitle("قارئ PDF احترافي - Professional PDF Reader")
+        self.setGeometry(100, 50, 1400, 900)
+        
+        # إنشاء القوائم
+        self.create_menus()
+        
+        # إنشاء أشرطة الأدوات
+        self.create_toolbars()
+        
+        # إنشاء العنصر المركزي
+        self.create_central_widget()
+        
+        # إنشاء الأشرطة الجانبية
+        self.create_docks()
+        
+        # إنشاء شريط الحالة
+        self.create_status_bar()
+        
+        # تحميل الإعدادات
+        self.load_window_state()
+    
+    def create_central_widget(self):
+        """إنشاء العنصر المركزي"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # التخطيط الرئيسي
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # إضافة شريط الأدوات الرئيسي
+        main_layout.addWidget(self.main_toolbar)
+        
+        # منطقة المحتوى
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Splitter للتحكم في الأشرطة الجانبية
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        
+        # إضافة الشريط الجانبي الأيسر
+        self.main_splitter.addWidget(self.left_dock.widget())
+        
+        # منطقة عرض PDF
+        self.pdf_canvas = PDFCanvas(self)
+        self.pdf_canvas.set_pdf_handler(self.pdf_handler)
+        
+        # ربط الإشارات
+        self.pdf_canvas.pageClicked.connect(self.on_page_changed)
+        self.pdf_canvas.zoomChanged.connect(self.on_zoom_changed)
+        self.pdf_canvas.annotationAdded.connect(self.on_annotation_added)
+        
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(self.pdf_canvas)
+        scroll_area.setWidgetResizable(True)
+        
+        self.main_splitter.addWidget(scroll_area)
+        self.main_splitter.setStretchFactor(1, 1)  # منح المنطقة المركزية مساحة أكبر
+        
+        # إضافة الشريط الجانبي الأيمن
+        self.main_splitter.addWidget(self.right_dock.widget())
+        
+        # تعيين أحجام Splitter
+        self.main_splitter.setSizes([200, 1000, 250])
+        
+        content_layout.addWidget(self.main_splitter)
+        main_layout.addWidget(content_widget)
+    
+    def create_menus(self):
+        """إنشاء القوائم"""
+        menubar = self.menuBar()
+        
+        # قائمة ملف
+        file_menu = menubar.addMenu("ملف")
+        
+        self.open_action = QAction("فتح...", self)
+        self.open_action.setShortcut("Ctrl+O")
+        self.open_action.triggered.connect(self.open_file)
+        file_menu.addAction(self.open_action)
+        
+        self.open_recent_menu = QMenu("فتح حديثاً", self)
+        file_menu.addMenu(self.open_recent_menu)
+        
+        file_menu.addSeparator()
+        
+        self.save_action = QAction("حفظ", self)
+        self.save_action.setShortcut("Ctrl+S")
+        self.save_action.triggered.connect(self.save_file)
+        file_menu.addAction(self.save_action)
+        
+        self.save_as_action = QAction("حفظ باسم...", self)
+        self.save_as_action.setShortcut("Ctrl+Shift+S")
+        self.save_as_action.triggered.connect(self.save_file_as)
+        file_menu.addAction(self.save_as_action)
+        
+        file_menu.addSeparator()
+        
+        self.print_action = QAction("طباعة...", self)
+        self.print_action.setShortcut("Ctrl+P")
+        self.print_action.triggered.connect(self.print_file)
+        file_menu.addAction(self.print_action)
+        
+        file_menu.addSeparator()
+        
+        self.export_text_action = QAction("تصدير إلى نص...", self)
+        self.export_text_action.triggered.connect(self.export_to_text)
+        file_menu.addAction(self.export_text_action)
+        
+        self.export_images_action = QAction("استخراج الصور...", self)
+        self.export_images_action.triggered.connect(self.extract_images)
+        file_menu.addAction(self.export_images_action)
+        
+        file_menu.addSeparator()
+        
+        self.properties_action = QAction("خصائص...", self)
+        self.properties_action.triggered.connect(self.show_properties)
+        file_menu.addAction(self.properties_action)
+        
+        file_menu.addSeparator()
+        
+        self.exit_action = QAction("خروج", self)
+        self.exit_action.setShortcut("Alt+F4")
+        self.exit_action.triggered.connect(self.close)
+        file_menu.addAction(self.exit_action)
+        
+        # قائمة تحرير
+        edit_menu = menubar.addMenu("تحرير")
+        
+        self.undo_action = QAction("تراجع", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        edit_menu.addAction(self.undo_action)
+        
+        self.redo_action = QAction("إعادة", self)
+        self.redo_action.setShortcut("Ctrl+Y")
+        edit_menu.addAction(self.redo_action)
+        
+        edit_menu.addSeparator()
+        
+        self.copy_action = QAction("نسخ", self)
+        self.copy_action.setShortcut("Ctrl+C")
+        edit_menu.addAction(self.copy_action)
+        
+        self.select_all_action = QAction("تحديد الكل", self)
+        self.select_all_action.setShortcut("Ctrl+A")
+        edit_menu.addAction(self.select_all_action)
+        
+        edit_menu.addSeparator()
+        
+        self.find_action = QAction("بحث...", self)
+        self.find_action.setShortcut("Ctrl+F")
+        self.find_action.triggered.connect(self.show_search_dialog)
+        edit_menu.addAction(self.find_action)
+        
+        self.find_next_action = QAction("بحث عن التالي", self)
+        self.find_next_action.setShortcut("F3")
+        self.find_next_action.triggered.connect(self.find_next)
+        edit_menu.addAction(self.find_next_action)
+        
+        self.find_prev_action = QAction("بحث عن السابق", self)
+        self.find_prev_action.setShortcut("Shift+F3")
+        self.find_prev_action.triggered.connect(self.find_previous)
+        edit_menu.addAction(self.find_prev_action)
+        
+        # قائمة عرض
+        view_menu = menubar.addMenu("عرض")
+        
+        self.zoom_in_action = QAction("تكبير", self)
+        self.zoom_in_action.setShortcut("Ctrl++")
+        self.zoom_in_action.triggered.connect(self.zoom_in)
+        view_menu.addAction(self.zoom_in_action)
+        
+        self.zoom_out_action = QAction("تصغير", self)
+        self.zoom_out_action.setShortcut("Ctrl+-")
+        self.zoom_out_action.triggered.connect(self.zoom_out)
+        view_menu.addAction(self.zoom_out_action)
+        
+        self.zoom_fit_action = QAction("ملاءمة للعرض", self)
+        self.zoom_fit_action.setShortcut("Ctrl+0")
+        self.zoom_fit_action.triggered.connect(self.zoom_fit)
+        view_menu.addAction(self.zoom_fit_action)
+        
+        self.zoom_actual_action = QAction("الحجم الفعلي", self)
+        self.zoom_actual_action.setShortcut("Ctrl+1")
+        self.zoom_actual_action.triggered.connect(self.zoom_actual)
+        view_menu.addAction(self.zoom_actual_action)
+        
+        view_menu.addSeparator()
+        
+        self.rotate_left_action = QAction("تدوير لليسار", self)
+        self.rotate_left_action.setShortcut("Ctrl+Shift+L")
+        self.rotate_left_action.triggered.connect(self.rotate_left)
+        view_menu.addAction(self.rotate_left_action)
+        
+        self.rotate_right_action = QAction("تدوير لليمين", self)
+        self.rotate_right_action.setShortcut("Ctrl+Shift+R")
+        self.rotate_right_action.triggered.connect(self.rotate_right)
+        view_menu.addAction(self.rotate_right_action)
+        
+        view_menu.addSeparator()
+        
+        self.toggle_toolbar_action = QAction("إظهار/إخفاء شريط الأدوات", self)
+        self.toggle_toolbar_action.setShortcut("F8")
+        self.toggle_toolbar_action.triggered.connect(self.toggle_toolbar)
+        view_menu.addAction(self.toggle_toolbar_action)
+        
+        self.toggle_statusbar_action = QAction("إظهار/إخفاء شريط الحالة", self)
+        self.toggle_statusbar_action.setShortcut("F9")
+        self.toggle_statusbar_action.triggered.connect(self.toggle_statusbar)
+        view_menu.addAction(self.toggle_statusbar_action)
+        
+        self.toggle_sidebar_action = QAction("إظهار/إخفاء الشريط الجانبي", self)
+        self.toggle_sidebar_action.setShortcut("F10")
+        self.toggle_sidebar_action.triggered.connect(self.toggle_sidebar)
+        view_menu.addAction(self.toggle_sidebar_action)
+        
+        view_menu.addSeparator()
+        
+        self.fullscreen_action = QAction("ملء الشاشة", self)
+        self.fullscreen_action.setShortcut("F11")
+        self.fullscreen_action.triggered.connect(self.toggle_fullscreen)
+        view_menu.addAction(self.fullscreen_action)
+        
+        # قائمة أدوات
+        tools_menu = menubar.addMenu("أدوات")
+        
+        self.hand_tool_action = QAction("أداة اليد", self)
+        self.hand_tool_action.setCheckable(True)
+        self.hand_tool_action.triggered.connect(lambda: self.set_tool("hand"))
+        tools_menu.addAction(self.hand_tool_action)
+        
+        self.select_tool_action = QAction("أداة التحديد", self)
+        self.select_tool_action.setCheckable(True)
+        self.select_tool_action.triggered.connect(lambda: self.set_tool("select"))
+        tools_menu.addAction(self.select_tool_action)
+        
+        tools_menu.addSeparator()
+        
+        self.highlight_tool_action = QAction("أداة التظليل", self)
+        self.highlight_tool_action.setCheckable(True)
+        self.highlight_tool_action.triggered.connect(lambda: self.set_tool("highlight"))
+        tools_menu.addAction(self.highlight_tool_action)
+        
+        self.underline_tool_action = QAction("أداة الخط السفلي", self)
+        self.underline_tool_action.setCheckable(True)
+        self.underline_tool_action.triggered.connect(lambda: self.set_tool("underline"))
+        tools_menu.addAction(self.underline_tool_action)
+        
+        self.strikeout_tool_action = QAction("أداة الشطب", self)
+        self.strikeout_tool_action.setCheckable(True)
+        self.strikeout_tool_action.triggered.connect(lambda: self.set_tool("strikeout"))
+        tools_menu.addAction(self.strikeout_tool_action)
+        
+        tools_menu.addSeparator()
+        
+        self.rectangle_tool_action = QAction("أداة المستطيل", self)
+        self.rectangle_tool_action.setCheckable(True)
+        self.rectangle_tool_action.triggered.connect(lambda: self.set_tool("rectangle"))
+        tools_menu.addAction(self.rectangle_tool_action)
+        
+        self.circle_tool_action = QAction("أداة الدائرة", self)
+        self.circle_tool_action.setCheckable(True)
+        self.circle_tool_action.triggered.connect(lambda: self.set_tool("circle"))
+        tools_menu.addAction(self.circle_tool_action)
+        
+        tools_menu.addSeparator()
+        
+        self.note_tool_action = QAction("أداة الملاحظة", self)
+        self.note_tool_action.setCheckable(True)
+        self.note_tool_action.triggered.connect(lambda: self.set_tool("note"))
+        tools_menu.addAction(self.note_tool_action)
+        
+        # قائمة إعدادات
+        settings_menu = menubar.addMenu("إعدادات")
+        
+        self.preferences_action = QAction("تفضيلات...", self)
+        self.preferences_action.setShortcut("Ctrl+,")
+        self.preferences_action.triggered.connect(self.show_preferences)
+        settings_menu.addAction(self.preferences_action)
+        
+        # قائمة مساعدة
+        help_menu = menubar.addMenu("مساعدة")
+        
+        self.help_action = QAction("دليل الاستخدام", self)
+        self.help_action.setShortcut("F1")
+        self.help_action.triggered.connect(self.show_help)
+        help_menu.addAction(self.help_action)
+        
+        help_menu.addSeparator()
+        
+        self.about_action = QAction("حول قارئ PDF", self)
+        self.about_action.triggered.connect(self.show_about)
+        help_menu.addAction(self.about_action)
+    
+    def create_toolbars(self):
+        """إنشاء أشرطة الأدوات"""
+        # شريط الأدوات الرئيسي
+        self.main_toolbar = QToolBar("الأدوات الرئيسية", self)
+        self.main_toolbar.setMovable(False)
+        self.addToolBar(self.main_toolbar)
+        
+        # إضافة الإجراءات إلى شريط الأدوات
+        self.main_toolbar.addAction(self.open_action)
+        self.main_toolbar.addAction(self.save_action)
+        self.main_toolbar.addSeparator()
+        
+        self.main_toolbar.addAction(self.zoom_out_action)
+        self.main_toolbar.addAction(self.zoom_in_action)
+        self.main_toolbar.addAction(self.zoom_fit_action)
+        self.main_toolbar.addSeparator()
+        
+        # شريط أدوات التعليقات
+        self.annotation_toolbar = QToolBar("أدوات التعليقات", self)
+        self.addToolBar(Qt.LeftToolBarArea, self.annotation_toolbar)
+        
+        self.annotation_toolbar.addAction(self.hand_tool_action)
+        self.annotation_toolbar.addAction(self.select_tool_action)
+        self.annotation_toolbar.addSeparator()
+        self.annotation_toolbar.addAction(self.highlight_tool_action)
+        self.annotation_toolbar.addAction(self.underline_tool_action)
+        self.annotation_toolbar.addAction(self.strikeout_tool_action)
+        self.annotation_toolbar.addSeparator()
+        self.annotation_toolbar.addAction(self.rectangle_tool_action)
+        self.annotation_toolbar.addAction(self.circle_tool_action)
+        self.annotation_toolbar.addAction(self.note_tool_action)
+        
+        # تفعيل أداة اليد افتراضياً
+        self.hand_tool_action.setChecked(True)
+    
+    def create_docks(self):
+        """إنشاء الأشرطة الجانبية"""
+        # الشريط الجانبي الأيسر (الصفحات المصغرة)
+        self.left_dock = QDockWidget("الصفحات المصغرة", self)
+        self.left_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        
+        self.thumbnail_panel = ThumbnailPanel(self)
+        self.left_dock.setWidget(self.thumbnail_panel)
+        
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
+        
+        # الشريط الجانبي الأيمن (المعلومات والتعليقات)
+        self.right_dock = QDockWidget("المعلومات", self)
+        self.right_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        
+        self.sidebar = SideBar(self)
+        self.right_dock.setWidget(self.sidebar)
+        
+        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+    
+    def create_status_bar(self):
+        """إنشاء شريط الحالة"""
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        
+        # معلومات الصفحة
+        self.page_label = QLabel("الصفحة: 0/0")
+        self.status_bar.addPermanentWidget(self.page_label)
+        
+        # معلومات التكبير
+        self.zoom_label = QLabel("التكبير: 100%")
+        self.status_bar.addPermanentWidget(self.zoom_label)
+        
+        # معلومات الملف
+        self.file_label = QLabel("لا يوجد ملف مفتوح")
+        self.status_bar.addWidget(self.file_label)
+        
+        # شريط التقدم
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.hide()
+        self.status_bar.addPermanentWidget(self.progress_bar)
+        
+        # معلومات المؤشر
+        self.cursor_label = QLabel("X: 0, Y: 0")
+        self.status_bar.addPermanentWidget(self.cursor_label)
+    
+    def setup_shortcuts(self):
+        """إعداد الاختصارات"""
+        # التنقل بين الصفحات
+        QShortcut(QKeySequence(Qt.Key_PageUp), self).activated.connect(
+            self.pdf_canvas.previous_page
+        )
+        QShortcut(QKeySequence(Qt.Key_PageDown), self).activated.connect(
+            self.pdf_canvas.next_page
+        )
+        QShortcut(QKeySequence(Qt.Key_Home), self).activated.connect(
+            self.first_page
+        )
+        QShortcut(QKeySequence(Qt.Key_End), self).activated.connect(
+            self.last_page
+        )
+        
+        # التكبير/التصغير
+        QShortcut(QKeySequence("Ctrl+="), self).activated.connect(
+            self.zoom_in
+        )
+        QShortcut(QKeySequence("Ctrl+-"), self).activated.connect(
+            self.zoom_out
+        )
+        QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(
+            self.zoom_fit
+        )
+        QShortcut(QKeySequence("Ctrl+1"), self).activated.connect(
+            self.zoom_actual
+        )
+        
+        # التدوير
+        QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(
+            self.rotate_left
+        )
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(
+            self.rotate_right
+        )
+        
+        # البحث
+        QShortcut(QKeySequence("F3"), self).activated.connect(
+            self.find_next
+        )
+        QShortcut(QKeySequence("Shift+F3"), self).activated.connect(
+            self.find_previous
+        )
+    
+    # ============================================================================
+    # معالجة الملفات
+    # ============================================================================
+    
+    def open_file(self, file_path=None):
+        """فتح ملف PDF"""
+        if not file_path:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "فتح ملف PDF",
+                "",
+                "ملفات PDF (*.pdf);;جميع الملفات (*)"
+            )
+        
+        if file_path:
+            self.show_progress("جاري فتح الملف...")
+            
+            success, message = self.pdf_handler.open_pdf(file_path)
+            
+            if success:
+                self.current_file = file_path
+                
+                # تحديث العنوان
+                self.setWindowTitle(f"قارئ PDF - {os.path.basename(file_path)}")
+                
+                # تحديث شريط الحالة
+                self.file_label.setText(f"الملف: {os.path.basename(file_path)}")
+                
+                # تحديث عرض PDF
+                self.pdf_canvas.set_pdf_handler(self.pdf_handler)
+                self.pdf_canvas.goto_page(0)
+                
+                # تحديث الصفحات المصغرة
+                self.thumbnail_panel.load_thumbnails(self.pdf_handler)
+                
+                # تحديث الشريط الجانبي
+                self.sidebar.update_info(self.pdf_handler)
+                
+                # إضافة إلى الملفات الحديثة
+                self.add_to_recent_files(file_path)
+                
+                # عرض رسالة النجاح
+                self.status_bar.showMessage(f"✅ {message}", 3000)
+                
+            else:
+                QMessageBox.critical(self, "خطأ", message)
+            
+            self.hide_progress()
+    
+    def save_file(self):
+        """حفظ الملف"""
+        if not self.current_file:
+            self.save_file_as()
+            return
+        
+        success, message = self.pdf_handler.save_pdf(self.current_file)
+        
+        if success:
+            self.status_bar.showMessage(f"✅ {message}", 3000)
+        else:
+            QMessageBox.critical(self, "خطأ", message)
+    
+    def save_file_as(self):
+        """حفظ الملف باسم جديد"""
+        if not self.pdf_handler.doc:
+            QMessageBox.warning(self, "تحذير", "لا يوجد ملف مفتوح للحفظ")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "حفظ ملف PDF",
+            "",
+            "ملفات PDF (*.pdf);;جميع الملفات (*)"
+        )
+        
+        if file_path:
+            success, message = self.pdf_handler.save_pdf(file_path)
+            
+            if success:
+                self.current_file = file_path
+                self.setWindowTitle(f"قارئ PDF - {os.path.basename(file_path)}")
+                self.status_bar.showMessage(f"✅ {message}", 3000)
+            else:
+                QMessageBox.critical(self, "خطأ", message)
+    
+    def print_file(self):
+        """طباعة الملف"""
+        # سيتم تنفيذ الطباعة في إصدار لاحق
+        QMessageBox.information(self, "طباعة", "ميزة الطباعة قيد التطوير")
+    
+    # ============================================================================
+    # عمليات التصدير
+    # ============================================================================
+    
+    def export_to_text(self):
+        """تصدير PDF إلى نص"""
+        if not self.pdf_handler.doc:
+            QMessageBox.warning(self, "تحذير", "لا يوجد ملف مفتوح للتصدير")
+            return
+        
+        dialog = ExportDialog(self.pdf_handler.total_pages, self)
+        if dialog.exec_():
+            params = dialog.get_export_params()
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "تصدير إلى نص",
+                "",
+                "ملفات النص (*.txt);;جميع الملفات (*)"
+            )
+            
+            if file_path:
+                self.show_progress("جاري التصدير...")
+                
+                success = self.pdf_handler.export_to_text(
+                    file_path,
+                    params['start_page'],
+                    params['end_page'],
+                    params['include_comments']
+                )
+                
+                if success:
+                    self.status_bar.showMessage(f"✅ تم تصدير النص بنجاح", 3000)
+                    QMessageBox.information(self, "نجاح", f"تم تصدير النص إلى:\n{file_path}")
+                else:
+                    QMessageBox.critical(self, "خطأ", "فشل في تصدير النص")
+                
+                self.hide_progress()
+    
+    def extract_images(self):
+        """استخراج الصور من PDF"""
+        if not self.pdf_handler.doc:
+            QMessageBox.warning(self, "تحذير", "لا يوجد ملف مفتوح")
+            return
+        
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "اختر مجلد لحفظ الصور",
+            ""
+        )
+        
+        if folder_path:
+            self.show_progress("جاري استخراج الصور...")
+            
+            images = self.pdf_handler.extract_images(folder_path)
+            
+            if images:
+                self.status_bar.showMessage(f"✅ تم استخراج {len(images)} صورة", 3000)
+                QMessageBox.information(
+                    self,
+                    "نجاح",
+                    f"تم استخراج {len(images)} صورة إلى:\n{folder_path}"
+                )
+            else:
+                QMessageBox.information(self, "معلومات", "لا توجد صور في الملف")
+            
+            self.hide_progress()
+    
+    # ============================================================================
+    # التنقل والبحث
+    # ============================================================================
+    
+    def on_page_changed(self, page_num, position):
+        """عند تغيير الصفحة"""
+        if self.pdf_handler:
+            self.update_page_info()
+            self.thumbnail_panel.select_thumbnail(page_num)
+            self.sidebar.update_page_info(page_num)
+    
+    def first_page(self):
+        """الذهاب إلى الصفحة الأولى"""
+        self.pdf_canvas.goto_page(0)
+    
+    def last_page(self):
+        """الذهاب إلى الصفحة الأخيرة"""
+        if self.pdf_handler:
+            self.pdf_canvas.goto_page(self.pdf_handler.total_pages - 1)
+    
+    def goto_page(self):
+        """الذهاب إلى صفحة محددة"""
+        if not self.pdf_handler.doc:
+            return
+        
+        dialog = GotoPageDialog(self.pdf_handler.total_pages, self)
+        if dialog.exec_():
+            page_num = dialog.get_page_number()
+            self.pdf_canvas.goto_page(page_num - 1)
+    
+    def show_search_dialog(self):
+        """إظهار نافذة البحث"""
+        if not self.pdf_handler.doc:
+            return
+        
+        dialog = SearchDialog(self)
+        if dialog.exec_():
+            search_text, case_sensitive = dialog.get_search_params()
+            self.search_text = search_text
+            self.case_sensitive = case_sensitive
+            
+            results = self.pdf_handler.search_in_pdf(search_text, case_sensitive)
+            
+            if results:
+                self.search_results = results
+                self.current_search_index = 0
+                self.navigate_to_search_result(self.current_search_index)
+                
+                self.status_bar.showMessage(f"تم العثور على {len(results)} نتيجة", 3000)
+            else:
+                QMessageBox.information(self, "بحث", "لم يتم العثور على نتائج")
+    
+    def find_next(self):
+        """البحث عن التالي"""
+        if hasattr(self, 'search_results') and self.search_results:
+            self.current_search_index = (self.current_search_index + 1) % len(self.search_results)
+            self.navigate_to_search_result(self.current_search_index)
+    
+    def find_previous(self):
+        """البحث عن السابق"""
+        if hasattr(self, 'search_results') and self.search_results:
+            self.current_search_index = (self.current_search_index - 1) % len(self.search_results)
+            self.navigate_to_search_result(self.current_search_index)
+    
+    def navigate_to_search_result(self, index):
+        """التنقل إلى نتيجة بحث"""
+        if 0 <= index < len(self.search_results):
+            result = self.search_results[index]
+            self.pdf_canvas.goto_page(result['page'])
+            self.current_search_index = index
+            self.status_bar.showMessage(f"النتيجة {index + 1} من {len(self.search_results)}", 2000)
+    
+    # ============================================================================
+    # التكبير والتدوير
+    # ============================================================================
+    
+    def zoom_in(self):
+        """تكبير"""
+        self.pdf_canvas.zoom_in()
+    
+    def zoom_out(self):
+        """تصغير"""
+        self.pdf_canvas.zoom_out()
+    
+    def zoom_fit(self):
+        """تكبير لملاءمة العرض"""
+        self.pdf_canvas.zoom_to_fit()
+    
+    def zoom_actual(self):
+        """تكبير 100%"""
+        self.pdf_canvas.zoom_to_actual()
+    
+    def on_zoom_changed(self, zoom_level):
+        """عند تغيير مستوى التكبير"""
+        zoom_percent = int(zoom_level * 100)
+        self.zoom_label.setText(f"التكبير: {zoom_percent}%")
+    
+    def rotate_left(self):
+        """تدوير عكس عقارب الساعة"""
+        self.pdf_canvas.rotate_left()
+    
+    def rotate_right(self):
+        """تدوير مع عقارب الساعة"""
+        self.pdf_canvas.rotate_right()
+    
+    # ============================================================================
+    # الأدوات والتعليقات
+    # ============================================================================
+    
+    def set_tool(self, tool_name):
+        """تعيين الأداة النشطة"""
+        # تحديث حالة أزرار الأدوات
+        self.hand_tool_action.setChecked(tool_name == "hand")
+        self.select_tool_action.setChecked(tool_name == "select")
+        self.highlight_tool_action.setChecked(tool_name == "highlight")
+        self.underline_tool_action.setChecked(tool_name == "underline")
+        self.strikeout_tool_action.setChecked(tool_name == "strikeout")
+        self.rectangle_tool_action.setChecked(tool_name == "rectangle")
+        self.circle_tool_action.setChecked(tool_name == "circle")
+        self.note_tool_action.setChecked(tool_name == "note")
+        
+        # تعيين وضع التفاعل في لوحة PDF
+        self.pdf_canvas.set_interaction_mode(tool_name)
+        
+        # عرض رسالة في شريط الحالة
+        tool_names = {
+            "hand": "أداة اليد",
+            "select": "أداة التحديد",
+            "highlight": "أداة التظليل",
+            "underline": "أداة الخط السفلي",
+            "strikeout": "أداة الشطب",
+            "rectangle": "أداة المستطيل",
+            "circle": "أداة الدائرة",
+            "note": "أداة الملاحظة"
+        }
+        
+        self.status_bar.showMessage(f"الأداة النشطة: {tool_names.get(tool_name, tool_name)}", 2000)
+    
+    def on_annotation_added(self, annotation_data):
+        """عند إضافة تعليق توضيحي"""
+        self.sidebar.add_annotation(annotation_data)
+        self.status_bar.showMessage("تم إضافة تعليق توضيحي", 2000)
+    
+    # ============================================================================
+    # عرض واجهة المستخدم
+    # ============================================================================
+    
+    def update_page_info(self):
+        """تحديث معلومات الصفحة"""
+        if self.pdf_handler:
+            self.page_label.setText(
+                f"الصفحة: {self.pdf_canvas.current_page + 1}/{self.pdf_handler.total_pages}"
+            )
+    
+    def update_cursor_position(self, pos):
+        """تحديث موضع المؤشر"""
+        if self.pdf_canvas.page_image:
+            img_pos = pos - self.pdf_canvas.image_offset
+            self.cursor_label.setText(f"X: {img_pos.x()}, Y: {img_pos.y()}")
+    
+    def toggle_toolbar(self):
+        """إظهار/إخفاء شريط الأدوات"""
+        self.main_toolbar.setVisible(not self.main_toolbar.isVisible())
+    
+    def toggle_statusbar(self):
+        """إظهار/إخفاء شريط الحالة"""
+        self.status_bar.setVisible(not self.status_bar.isVisible())
+    
+    def toggle_sidebar(self):
+        """إظهار/إخفاء الشريط الجانبي"""
+        self.left_dock.setVisible(not self.left_dock.isVisible())
+        self.right_dock.setVisible(not self.right_dock.isVisible())
+    
+    def toggle_fullscreen(self):
+        """تبديل وضع ملء الشاشة"""
+        if self.is_fullscreen:
+            self.showNormal()
+            if self.window_state_before_fullscreen:
+                self.restoreState(self.window_state_before_fullscreen)
+            self.is_fullscreen = False
+        else:
+            self.window_state_before_fullscreen = self.saveState()
+            self.showFullScreen()
+            self.is_fullscreen = True
+    
+    # ============================================================================
+    # النوافذ المنبثقة
+    # ============================================================================
+    
+    def show_properties(self):
+        """إظهار نافذة خصائص الملف"""
+        if not self.pdf_handler.doc:
+            QMessageBox.warning(self, "تحذير", "لا يوجد ملف مفتوح")
+            return
+        
+        metadata = self.pdf_handler.get_metadata()
+        dialog = PropertiesDialog(metadata, self)
+        dialog.exec_()
+    
+    def show_preferences(self):
+        """إظهار نافذة التفضيلات"""
+        dialog = SettingsDialog(self)
+        if dialog.exec_():
+            # تطبيق التغييرات
+            theme = dialog.get_selected_theme()
+            self.apply_theme(theme)
+    
+    def show_about(self):
+        """إظهار نافذة حول"""
+        dialog = AboutDialog(self)
+        dialog.exec_()
+    
+    def show_help(self):
+        """إظهار دليل الاستخدام"""
+        QMessageBox.information(
+            self,
+            "دليل الاستخدام",
+            "قارئ PDF احترافي\n\n"
+            "اختصارات لوحة المفاتيح:\n"
+            "• Ctrl+O: فتح ملف\n"
+            "• Ctrl+S: حفظ\n"
+            "• Ctrl+F: بحث\n"
+            "• PgUp/PgDown: التنقل بين الصفحات\n"
+            "• Ctrl++/Ctrl+-: التكبير/التصغير\n"
+            "• F11: ملء الشاشة\n"
+            "\n"
+            "للمساعدة الإضافية، تفضل بزيارة موقع المشروع."
+        )
+    
+    # ============================================================================
+    # الإعدادات والتخصيص
+    # ============================================================================
+    
+    def apply_theme(self, theme_name):
+        """تطبيق سمة"""
+        stylesheet = self.theme_manager.get_stylesheet(theme_name)
+        self.setStyleSheet(stylesheet)
+        self.save_theme_preference(theme_name)
+    
+    def load_settings(self):
+        """تحميل الإعدادات"""
+        # تحميل السمة
+        theme = self.settings.value("theme", "light")
+        self.apply_theme(theme)
+        
+        # تحميل الملفات الحديثة
+        self.recent_files = self.settings.value("recent_files", [])
+        self.update_recent_files_menu()
+        
+        # تحميل حجم النافذة وموضعها
+        geometry = self.settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+    
+    def save_settings(self):
+        """حفظ الإعدادات"""
+        # حفظ السمة
+        self.settings.setValue("theme", self.theme_manager.get_current_theme())
+        
+        # حفظ الملفات الحديثة
+        self.settings.setValue("recent_files", self.recent_files[:10])
+        
+        # حفظ حجم النافذة وموضعها
+        self.settings.setValue("window_geometry", self.saveGeometry())
+        
+        # حفظ حالة النافذة
+        self.settings.setValue("window_state", self.saveState())
+        
+        self.settings.sync()
+    
+    def save_theme_preference(self, theme_name):
+        """حفظ تفضيل السمة"""
+        self.theme_manager.set_current_theme(theme_name)
+    
+    def load_window_state(self):
+        """تحميل حالة النافذة"""
+        state = self.settings.value("window_state")
+        if state:
+            self.restoreState(state)
+    
+    def add_to_recent_files(self, file_path):
+        """إضافة ملف إلى قائمة الملفات الحديثة"""
+        if file_path in self.recent_files:
+            self.recent_files.remove(file_path)
+        
+        self.recent_files.insert(0, file_path)
+        
+        # حفظ فقط آخر 10 ملفات
+        self.recent_files = self.recent_files[:10]
+        
+        self.update_recent_files_menu()
+    
+    def update_recent_files_menu(self):
+        """تحديث قائمة الملفات الحديثة"""
+        self.open_recent_menu.clear()
+        
+        if not self.recent_files:
+            action = QAction("لا توجد ملفات حديثة", self)
+            action.setEnabled(False)
+            self.open_recent_menu.addAction(action)
+            return
+        
+        for file_path in self.recent_files:
+            if os.path.exists(file_path):
+                action = QAction(os.path.basename(file_path), self)
+                action.setData(file_path)
+                action.triggered.connect(lambda checked, path=file_path: self.open_file(path))
+                self.open_recent_menu.addAction(action)
+        
+        self.open_recent_menu.addSeparator()
+        clear_action = QAction("مسح القائمة", self)
+        clear_action.triggered.connect(self.clear_recent_files)
+        self.open_recent_menu.addAction(clear_action)
+    
+    def clear_recent_files(self):
+        """مسح قائمة الملفات الحديثة"""
+        self.recent_files = []
+        self.update_recent_files_menu()
+        self.settings.setValue("recent_files", [])
+    
+    def load_last_file(self):
+        """تحميل آخر ملف تم فتحه"""
+        if self.recent_files and os.path.exists(self.recent_files[0]):
+            reply = QMessageBox.question(
+                self,
+                "فتح آخر ملف",
+                f"هل تريد فتح آخر ملف:\n{os.path.basename(self.recent_files[0])}?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.open_file(self.recent_files[0])
+    
+    # ============================================================================
+    # إدارة التقدم
+    # ============================================================================
+    
+    def show_progress(self, message):
+        """إظهار شريط التقدم"""
+        self.progress_bar.show()
+        self.progress_bar.setRange(0, 0)  # وضع غير محدد
+        self.status_bar.showMessage(message)
+        QApplication.processEvents()
+    
+    def hide_progress(self):
+        """إخفاء شريط التقدم"""
+        self.progress_bar.hide()
+        self.status_bar.clearMessage()
+    
+    # ============================================================================
+    # أحداث النافذة
+    # ============================================================================
+    
+    def closeEvent(self, event):
+        """معالجة إغلاق النافذة"""
+        # حفظ الإعدادات
+        self.save_settings()
+        
+        # إغلاق ملف PDF
+        self.pdf_handler.close_pdf()
+        
+        # تأكيد الإغلاق
+        reply = QMessageBox.question(
+            self,
+            'تأكيد الخروج',
+            'هل أنت متأكد من الخروج؟',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            event.accept()
+        else:
+            event.ignore()
+
+
+# تشغيل مباشر للاختبار
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("قارئ PDF احترافي")
+    app.setOrganizationName("PDFReader")
+    
+    window = MainWindow()
+    sys.exit(app.exec_())
